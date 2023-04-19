@@ -8,14 +8,331 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <map>
+#include <iostream>
+#include <netdb.h>
 /* You will to add includes here */
 
 // Included to get the support library
 #include "calcLib.h"
 
 #include "protocol.h"
+
+#define DNS_SERVER_PORT 53
+#define DNS_SERVER_IP "114.114.114.114"
+
+#define DNS_HOST 0x01
+#define DNS_CNAME 0x05
+
+using std::cout;
+using std::endl;
 using std::map;
 using std::string;
+
+struct dns_header
+{
+
+  unsigned short id;    // 会话标识
+  unsigned short flags; // 标志
+
+  unsigned short questions; // 问题数
+  unsigned short answer;    // 回答 资源记录数
+
+  unsigned short authority;  // 授权 资源记录数
+  unsigned short additional; // 附加 资源记录数
+};
+
+struct dns_queries
+{
+
+  int length;
+  unsigned short qtype;
+  unsigned short qclass;
+  unsigned char *name;
+};
+
+struct dns_item
+{
+
+  char *domain;
+  char *ip;
+};
+
+// client sendto dns server
+
+int dns_create_header(struct dns_header *header)
+{
+
+  if (header == NULL)
+    return -1;
+  memset(header, 0, sizeof(struct dns_header));
+
+  // random
+  srandom(time(NULL));
+  header->id = random();
+
+  header->flags = htons(0x0100); // 转化成网络字节序
+  header->questions = htons(1);
+}
+
+// hostname:  www.baidu.com
+
+// name:		3www5baidu3com0
+
+int dns_create_queries(struct dns_queries *question, const char *hostname)
+{
+
+  if (question == NULL || hostname == NULL)
+    return -1;
+  memset(question, 0, sizeof(struct dns_queries));
+
+  question->name = (unsigned char *)malloc(strlen(hostname) + 2);
+  if (question->name == NULL)
+  {
+    return -2;
+  }
+
+  question->length = strlen(hostname) + 2;
+
+  question->qtype = htons(1);
+  question->qclass = htons(1);
+
+  const char delim[2] = ".";
+  char *qname = (char *)question->name;
+
+  char *hostname_dup = strdup(hostname); // strdup -->malloc
+  char *token = strtok(hostname_dup, delim);
+
+  while (token != NULL)
+  {
+
+    size_t len = strlen(token);
+
+    *qname = len;
+    qname++;
+
+    strncpy(qname, token, len + 1);
+    qname += len;
+
+    token = strtok(NULL, delim);
+  }
+
+  free(hostname_dup);
+}
+
+int dns_build_request(struct dns_header *header, struct dns_queries *question, char *request, int rlen)
+{
+
+  if (header == NULL || question == NULL || request == NULL)
+    return -1;
+
+  int offset = 0;
+
+  memset(request, 0, rlen);
+
+  memcpy(request, header, sizeof(struct dns_header));
+  offset = sizeof(struct dns_header);
+
+  memcpy(request + offset, question->name, question->length);
+  offset += question->length;
+
+  memcpy(request + offset, &question->qtype, sizeof(question->qtype));
+  offset += sizeof(question->qtype);
+
+  memcpy(request + offset, &question->qclass, sizeof(question->qclass));
+  offset += sizeof(question->qclass);
+
+  return offset;
+}
+
+static int is_pointer(int in)
+{
+  return ((in & 0xC0) == 0xC0);
+}
+
+static void dns_parse_name(unsigned char *chunk, unsigned char *ptr, char *out, int *len)
+{
+
+  int flag = 0, n = 0, alen = 0;
+  char *pos = out + (*len);
+
+  while (1)
+  {
+
+    flag = (int)ptr[0];
+    if (flag == 0)
+      break;
+
+    if (is_pointer(flag))
+    {
+
+      n = (int)ptr[1];
+      ptr = chunk + n;
+      dns_parse_name(chunk, ptr, out, len);
+      break;
+    }
+    else
+    {
+
+      ptr++;
+      memcpy(pos, ptr, flag);
+      pos += flag;
+      ptr += flag;
+
+      *len += flag;
+      if ((int)ptr[0] != 0)
+      {
+        memcpy(pos, ".", 1);
+        pos += 1;
+        (*len) += 1;
+      }
+    }
+  }
+}
+
+static int dns_parse_response(char *buffer, struct dns_item **domains)
+{
+
+  int i = 0;
+  unsigned char *ptr = (unsigned char *)buffer;
+
+  ptr += 4;
+  int querys = ntohs(*(unsigned short *)ptr);
+
+  ptr += 2;
+  int answers = ntohs(*(unsigned short *)ptr);
+
+  ptr += 6;
+  for (i = 0; i < querys; i++)
+  {
+    while (1)
+    {
+      int flag = (int)ptr[0];
+      ptr += (flag + 1);
+
+      if (flag == 0)
+        break;
+    }
+    ptr += 4;
+  }
+
+  char cname[128], aname[128], ip[20], netip[4];
+  int len, type, ttl, datalen;
+
+  int cnt = 0;
+  struct dns_item *list = (struct dns_item *)calloc(answers, sizeof(struct dns_item));
+  if (list == NULL)
+  {
+    return -1;
+  }
+
+  for (i = 0; i < answers; i++)
+  {
+
+    bzero(aname, sizeof(aname));
+    len = 0;
+
+    dns_parse_name((unsigned char *)buffer, ptr, aname, &len);
+    ptr += 2;
+
+    type = htons(*(unsigned short *)ptr);
+    ptr += 4;
+
+    ttl = htons(*(unsigned short *)ptr);
+    ptr += 4;
+
+    datalen = ntohs(*(unsigned short *)ptr);
+    ptr += 2;
+
+    if (type == DNS_CNAME)
+    {
+
+      bzero(cname, sizeof(cname));
+      len = 0;
+      dns_parse_name((unsigned char *)buffer, ptr, cname, &len);
+      ptr += datalen;
+    }
+    else if (type == DNS_HOST)
+    {
+
+      bzero(ip, sizeof(ip));
+
+      if (datalen == 4)
+      {
+        memcpy(netip, ptr, datalen);
+        inet_ntop(AF_INET, netip, ip, sizeof(struct sockaddr));
+
+        printf("%s has address %s\n", aname, ip);
+        printf("\tTime to live: %d minutes , %d seconds\n", ttl / 60, ttl % 60);
+
+        list[cnt].domain = (char *)calloc(strlen(aname) + 1, 1);
+        memcpy(list[cnt].domain, aname, strlen(aname));
+
+        list[cnt].ip = (char *)calloc(strlen(ip) + 1, 1);
+        memcpy(list[cnt].ip, ip, strlen(ip));
+
+        cnt++;
+      }
+
+      ptr += datalen;
+    }
+  }
+
+  *domains = list;
+  ptr += 2;
+
+  return cnt;
+}
+
+char *dns_client_commit(const char *domain)
+{
+
+  int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sockfd < 0)
+  {
+    return NULL;
+  }
+
+  struct sockaddr_in servaddr = {0};
+  servaddr.sin_family = AF_INET;
+  servaddr.sin_port = htons(DNS_SERVER_PORT);
+  servaddr.sin_addr.s_addr = inet_addr(DNS_SERVER_IP);
+
+  int ret = connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
+  // printf("cooect: %d\n", ret);
+
+  struct dns_header header = {0};
+  dns_create_header(&header);
+
+  struct dns_queries question = {0};
+  dns_create_queries(&question, domain);
+
+  char request[1024] = {0};
+  int length = dns_build_request(&header, &question, request, 1024);
+
+  // request
+  int slen = sendto(sockfd, request, length, 0, (struct sockaddr *)&servaddr, sizeof(struct sockaddr));
+
+  // recvfrom
+  char response[1024] = {0};
+  struct sockaddr_in addr = {0};
+  size_t addr_len = sizeof(struct sockaddr_in);
+
+  int n = recvfrom(sockfd, response, sizeof(response), 0, (struct sockaddr *)&addr, (socklen_t *)&addr_len);
+
+  // printf("recvfrom: %d,%s\n", n, response);
+
+  struct dns_item *dns_domain = NULL;
+  dns_parse_response(response, &dns_domain);
+  if (dns_domain->ip == NULL)
+  {
+    return (char *)domain;
+  }
+
+  free(dns_domain);
+  return dns_domain->ip;
+
+  // return n;
+}
 
 typedef unsigned char byte;
 // transform from calcMessage to the byte array
@@ -178,7 +495,9 @@ int main(int argc, char *argv[])
 #ifdef DEBUG
   printf("Host %s, and port %d.\n", Desthost, port);
 #endif
-
+  // DNS parse
+  char *ip = dns_client_commit(Desthost);
+  cout << "Connected to " << ip << ":" << port;
   // the former is to output the host and port
   // begin to connect to the server and continue the task
   int socket_id;             // the socket id
@@ -194,21 +513,43 @@ int main(int argc, char *argv[])
   // assign the server
   server.sin_family = AF_INET;
   server.sin_port = htons(port);
-  server.sin_addr.s_addr = inet_addr(Desthost);
+  server.sin_addr.s_addr = inet_addr(ip);
 
+  // 绑定本地IP地址和端口号
+  sockaddr_in client_addr{};
+  client_addr.sin_family = AF_INET;
+  client_addr.sin_addr.s_addr = htonl(INADDR_ANY); // 绑定所有IP地址
+  client_addr.sin_port = htons(0);                 // 随机选择一个本地端口号
+  bind(socket_id, (sockaddr *)&client_addr, sizeof(client_addr));
+
+  // 获取绑定的本地端口号
+  sockaddr_in addr{};
+  socklen_t addrlen = sizeof(addr);
+  getsockname(socket_id, (sockaddr *)&client_addr, &addrlen);
+
+  cout << " local 127.0.0.1:" << client_addr.sin_port << endl;
   // printf("the client tries to connect the server...\n");
+  // socklen_t addrlen = sizeof(server);
+  // if (getsockname(socket_id, reinterpret_cast<sockaddr *>(&server), &addrlen) == -1)
+  // {
+  //   perror("getsockname error");
+  //   close(socket_id);
+  //   return 1;
+  // }
 
+  // cout << "Local port: " << ntohs(server.sin_port) << endl;
   // begin to connect
   if (connect(socket_id, (struct sockaddr *)&server, sizeof(server)) < 0)
   {
     printf("connect failed!\n");
     return 1;
   }
+  printf("connect success!\n");
 
   // begin to start the task
-  //byte sendbf[1024]; // sed buffer to sed data to server
+  // byte sendbf[1024]; // sed buffer to sed data to server
   byte recvbf[1024]; // receive buffer to get data from server
-  //memset(sendbf, '\0', 1024);
+  // memset(sendbf, '\0', 1024);
   memset(recvbf, '\0', 1024);
 
   // 1.first sed,client->server calcmessage(type,message,protocol,major_version,minor_version)
@@ -244,11 +585,11 @@ int main(int argc, char *argv[])
     {
       if (first_times == 3)
       {
-        printf("first_error:receive failed:%s\n", strerror(errno));
+        printf("first_send_error:receive failed:%s\n", strerror(errno));
         close(socket_id);
         return 0; // exit the program
       }
-      printf("first_times:%d---timeout, no input!\n", first_times);
+      printf("first_times_send:%d---timeout, no input!\n", first_times);
       first_times++;
     }
     else
@@ -282,21 +623,10 @@ int main(int argc, char *argv[])
   // printf("protocol.type: %d\n",protocol.type);
   // printf("protocol.major_version:%d\n",protocol.major_version);
   // printf("protocol.arith: %d\n",protocol.arith);
-  string arith = operation_map[protocol.arith];
-  if (arith.length() == 3)
-  {
-    printf("Assignment: %s %d %d\n", operation_map[protocol.arith].c_str(), protocol.inValue1, protocol.inValue2);
-    // sprintf((char *)sedbf, "%s %d %d", operation_map[protocol.arith].c_str(), protocol.inValue1, protocol.inValue2);
-  }
-  else
-  {
-    printf("Assignment: %s %8.8g %8.8g\n", operation_map[protocol.arith].c_str(), protocol.flValue1, protocol.flValue2);
-    // sprintf((char *)sedbf, "%s %8.8g %8.8g", operation_map[protocol.arith].c_str(), protocol.flValue1, protocol.flValue2);
-  }
   // 4.1 calculate the result
   calcProtocol second_sendto_protocol;
   // printf("size of protocol:%ld\n",sizeof(second_sendto_protocol));
-  second_sendto_protocol.type = 22;
+  second_sendto_protocol.type = 2;
   second_sendto_protocol.major_version = 1;
   second_sendto_protocol.minor_version = 0;
   second_sendto_protocol.id = protocol.id;
@@ -335,6 +665,22 @@ int main(int argc, char *argv[])
     second_sendto_protocol.flResult = protocol.flValue1 / protocol.flValue2;
     break;
   }
+  string arith = operation_map[protocol.arith];
+  char myresult[20];
+  if (arith.length() == 3)
+  {
+    printf("Assignment: %s %d %d\n", operation_map[protocol.arith].c_str(), protocol.inValue1, protocol.inValue2);
+    printf("Calculated the result to %d\n", second_sendto_protocol.inResult);
+    sprintf(myresult, "(myresult=%d)\n", second_sendto_protocol.inResult);
+    // sprintf((char *)sedbf, "%s %d %d", operation_map[protocol.arith].c_str(), protocol.inValue1, protocol.inValue2);
+  }
+  else
+  {
+    printf("Assignment: %s %8.8g %8.8g\n", operation_map[protocol.arith].c_str(), protocol.flValue1, protocol.flValue2);
+    printf("Calculated the result to %8.8g\n", second_sendto_protocol.flResult);
+    sprintf(myresult, "(myresult=%8.8g)\n", second_sendto_protocol.flResult);
+    // sprintf((char *)sedbf, "%s %8.8g %8.8g", operation_map[protocol.arith].c_str(), protocol.flValue1, protocol.flValue2);
+  }
   // if (is_correct)
   // {
   //   second_message.message = 1;
@@ -368,11 +714,11 @@ int main(int argc, char *argv[])
     {
       if (second_times == 3)
       {
-        printf("second_error:receive failed:%s\n", strerror(errno));
+        printf("second__send_error:receive failed:%s\n", strerror(errno));
         close(socket_id);
         return 0; // exit the program
       }
-      printf("second_times:%d---timeout, no input!\n", second_times);
+      printf("second_times_send:%d---timeout, no input!\n", second_times);
       second_times++;
     }
     else
@@ -389,7 +735,7 @@ int main(int argc, char *argv[])
   switch (second_recv_calcMessage.message)
   {
   case 1:
-    printf("OK\n");
+    printf("OK %s\n", myresult);
     break;
   case 2:
     printf("NOT OK\n");
