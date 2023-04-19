@@ -626,7 +626,7 @@ int main(int argc, char *argv[])
   // 4.1 calculate the result
   calcProtocol second_sendto_protocol;
   // printf("size of protocol:%ld\n",sizeof(second_sendto_protocol));
-  second_sendto_protocol.type = 2;
+  second_sendto_protocol.type = 22;
   second_sendto_protocol.major_version = 1;
   second_sendto_protocol.minor_version = 0;
   second_sendto_protocol.id = protocol.id;
